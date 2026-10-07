@@ -43,6 +43,8 @@ pub struct ObjectType {
     pub mesh_shadow: Vec<bool>,
     /// `[shadow]` per loaded mesh: the meshes OMSI casts (stencil) shadows from.
     pub mesh_casts: Vec<bool>,
+    /// Whether any loaded mesh carries a `[mouseevent]`.
+    pub has_mouse_events: bool,
     /// Compiled scripts when the object is scripted or animated.
     pub program: Option<Arc<omsi_script::Program>>,
     /// Further `[LOD]` levels: (min screen size, meshes), in model order after LOD 0.
@@ -346,6 +348,19 @@ pub struct PageHit {
     /// 0..1 across the page, `v` down from the top.
     pub u: f32,
     pub v: f32,
+}
+
+/// Where a ray lands on a mesh of a scenery object with a `[mouseevent]`: see
+/// [`World::scenery_object_hit`].
+#[derive(Clone, Debug)]
+pub struct SceneryHit {
+    /// Distance (m) along the ray.
+    pub t: f32,
+    pub map_id: i64,
+    #[allow(dead_code)]
+    pub mesh_index: usize,
+    /// The event name from the mesh's `[mouseevent]`.
+    pub event: String,
 }
 
 /// What the timetable tells the scenery: the time of day, and the buses due at the stops
@@ -3272,6 +3287,9 @@ impl World {
             }
             let paint_scheme_count = paint_schemes.len();
             // scripts (or an empty program) for objects that are scripted or animated
+            let has_mouse_events = mesh_def_index.iter().any(|d| {
+                model.meshes.get(*d).and_then(|m| m.mouse_event.as_ref()).is_some()
+            });
             let animated = mesh_def_index.iter().any(|d| {
                 !model.meshes[*d].animations.is_empty() || model.meshes[*d].visible.is_some()
             });
@@ -3283,6 +3301,7 @@ impl World {
                 || !sco.scripts.varlists.is_empty()
                 || has_freetex
                 || animated
+                || has_mouse_events
                 || sco.sound.is_some()
             {
                 Some(Arc::new(omsi_sim::scenery::compile_scenery(
@@ -3378,6 +3397,7 @@ impl World {
                 mesh_pivots,
                 mesh_shadow,
                 mesh_casts,
+                has_mouse_events,
                 program,
                 lower_lods,
                 lod0_min,
@@ -7930,6 +7950,7 @@ impl World {
                             || !script_texts.is_empty()
                             || !html_pages.is_empty()
                             || !ot.dynamic_textures.is_empty()
+                            || ot.has_mouse_events
                         {
                             let arrivals = inst.wants_arrivals();
                             // (a scripted object with [terrainmapping] slots had more instances
@@ -9569,6 +9590,109 @@ impl World {
             Some(o) => o.inst.html_pointer(page, u, v, kind),
             None => false,
         }
+    }
+
+    /// Finds the closest scenery object mesh carrying a `[mouseevent]` under a ray.
+    pub fn scenery_object_hit(&self, origin: DVec3, dir: glam::Vec3, reach: f32, spread: f32) -> Option<SceneryHit> {
+        let scripted = self.scripted.lock();
+        let mut best: Option<SceneryHit> = None;
+        let right = glam::Vec3::new(-dir.y, dir.x, 0.0).normalize_or_zero();
+        let up = dir.cross(right).normalize_or_zero();
+        let dirs = if spread > 0.0 {
+            vec![
+                dir,
+                (dir + right * spread).normalize(),
+                (dir - right * spread).normalize(),
+                (dir + up * spread).normalize(),
+                (dir - up * spread).normalize(),
+            ]
+        } else {
+            vec![dir]
+        };
+        for o in scripted.iter().filter(|o| o.ty.has_mouse_events) {
+            if (o.pos - origin).length() > reach as f64 + 60.0 {
+                continue;
+            }
+            let local = (origin - o.pos).as_vec3();
+            for mi in 0..o.ty.meshes.len() {
+                let Some((data, _, _)) = o.ty.meshes.get(mi) else { continue };
+                if !o.inst.mesh_visible.get(mi).copied().unwrap_or(true) {
+                    continue;
+                }
+                let Some(&def_idx) = o.ty.mesh_def_index.get(mi) else { continue };
+                let Some(event) = o.ty.model.meshes.get(def_idx).and_then(|m| m.mouse_event.as_ref()) else { continue };
+                let xf = o.xf * o.inst.mesh_transforms.get(mi).copied().unwrap_or(Mat4::IDENTITY);
+                for d in &dirs {
+                    if let Some(t) = omsi_geometry::ray_mesh(local, *d, data, &xf) {
+                        if t <= reach && best.as_ref().map_or(true, |b| t < b.t) {
+                            best = Some(SceneryHit {
+                                map_id: o.map_id,
+                                mesh_index: mi,
+                                event: event.clone(),
+                                t,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Click down on a scenery object's `[mouseevent]` switch or button.
+    pub fn scenery_object_click(&self, map_id: i64, event: &str) -> bool {
+        let mut scripted = self.scripted.lock();
+        let Some(o) = scripted.iter_mut().find(|o| o.map_id == map_id) else {
+            return false;
+        };
+        log::info!("scenery mouse event {event} on object {map_id}");
+        let ok = o.inst.trigger(event);
+        let drag = format!("{event}_drag");
+        let low = event.to_ascii_lowercase();
+        if (low.contains("taste") || low.contains("button") || low.contains("click"))
+            && o.inst.program.trigger(&drag).is_some()
+        {
+            o.inst.host.mouse = (0.0, 0.0);
+            o.inst.trigger(&drag);
+            o.inst.host.mouse = (0.0, 0.0);
+        }
+        ok
+    }
+
+    /// Mouse dragged while holding down a scenery object switch.
+    pub fn scenery_object_drag(&self, map_id: i64, event: &str, dx: f32, dy: f32) -> bool {
+        let mut scripted = self.scripted.lock();
+        let Some(o) = scripted.iter_mut().find(|o| o.map_id == map_id) else {
+            return false;
+        };
+        let drag = format!("{event}_drag");
+        o.inst.host.mouse = (dx, dy);
+        let ok = o.inst.trigger(&drag);
+        o.inst.host.mouse = (0.0, 0.0);
+        ok
+    }
+
+    /// Mouse button released from a scenery object switch (`<event>_off`).
+    pub fn scenery_object_release(&self, map_id: i64, event: &str) -> bool {
+        let mut scripted = self.scripted.lock();
+        let Some(o) = scripted.iter_mut().find(|o| o.map_id == map_id) else {
+            return false;
+        };
+        let off = format!("{event}_off");
+        o.inst.trigger(&off)
+    }
+
+    /// Mouse wheel notch over a scenery object switch.
+    pub fn scenery_object_wheel(&self, map_id: i64, event: &str, amount: f32) -> bool {
+        let mut scripted = self.scripted.lock();
+        let Some(o) = scripted.iter_mut().find(|o| o.map_id == map_id) else {
+            return false;
+        };
+        o.inst.host.mouse = (0.0, amount);
+        let _ = o.inst.trigger(&format!("{event}_drag"));
+        o.inst.host.mouse = (0.0, 0.0);
+        o.inst.trigger(&format!("{event}_off"))
     }
 
     /// The colour the tile's night light map (its own part, see [`own_tile_of_light_map`])
@@ -14631,6 +14755,137 @@ mod material_tests {
         // 4. Returns None when no matching string exists
         let name_empty = resolve_scenery_freetex_name("Missing", &ov1, &overrides, None, None, &[]);
         assert_eq!(name_empty, None);
+    }
+
+    #[test]
+    fn scenery_mouseevent_hit_and_trigger() {
+        let dir = std::env::temp_dir().join(format!("openomsi-scenery-mouseevent-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("global.cfg"), "[map]\n0\n0\n0\n").unwrap();
+        let world = World::open(&dir, &dir.join("global.cfg"), 20261001).unwrap();
+
+        let mut mesh_data = omsi_geometry::MeshData::default();
+        mesh_data.positions = vec![
+            glam::Vec3::new(-1.0, 5.0, -1.0),
+            glam::Vec3::new(1.0, 5.0, -1.0),
+            glam::Vec3::new(1.0, 5.0, 1.0),
+            glam::Vec3::new(-1.0, 5.0, 1.0),
+        ];
+        mesh_data.indices = vec![0, 1, 2, 0, 2, 3];
+
+        let mut model = omsi_model::Model::default();
+        let mut mdef = omsi_model::MeshDef::default();
+        mdef.mouse_event = Some("toggle_switch".to_string());
+        model.meshes.push(mdef);
+
+        let mut prog = omsi_script::Program::default();
+        let var_id = prog.declare_var("Switch");
+        prog.blocks.push(omsi_script::compile::Block {
+            name: "toggle_switch".into(),
+            ops: vec![
+                omsi_script::Op::Load(var_id),
+                omsi_script::Op::Not,
+                omsi_script::Op::Store(var_id),
+            ],
+            ..Default::default()
+        });
+        prog.triggers.insert("toggle_switch".into(), 0);
+        prog.blocks.push(omsi_script::compile::Block {
+            name: "toggle_switch_drag".into(),
+            ops: vec![
+                omsi_script::Op::LoadSys(omsi_script::SysVar::MouseX),
+                omsi_script::Op::Store(var_id),
+            ],
+            ..Default::default()
+        });
+        prog.triggers.insert("toggle_switch_drag".into(), 1);
+        prog.blocks.push(omsi_script::compile::Block {
+            name: "toggle_switch_off".into(),
+            ops: vec![
+                omsi_script::Op::Push(0.0),
+                omsi_script::Op::Store(var_id),
+            ],
+            ..Default::default()
+        });
+        prog.triggers.insert("toggle_switch_off".into(), 2);
+
+        let inst = omsi_sim::scenery::SceneryInstance::new(
+            Arc::new(prog),
+            &[],
+            omsi_sim::SimClock::default(),
+            &[],
+        );
+
+        let ot = Arc::new(ObjectType {
+            sco: omsi_scenery::sco::SceneryObject::default(),
+            sound_path: Default::default(),
+            model,
+            model_dir: dir.clone(),
+            meshes: vec![(mesh_data, Vec::new(), Vec::new())],
+            mesh_visible: vec![None],
+            mesh_def_index: vec![0],
+            mesh_pivots: vec![glam::Mat4::IDENTITY],
+            mesh_shadow: vec![false],
+            mesh_casts: vec![false],
+            has_mouse_events: true,
+            program: None,
+            lower_lods: Vec::new(),
+            lod0_min: 0.0,
+            paint_scheme_count: 0,
+            dynamic_textures: Vec::new(),
+            holes: Vec::new(),
+            deform: None,
+            collision: None,
+            paint: false,
+            camera: Default::default(),
+            collision_shape: Default::default(),
+        });
+
+        world.scripted.lock().push(ScriptedObject {
+            ty: ot,
+            pos: DVec3::ZERO,
+            xf: glam::Mat4::IDENTITY,
+            instances: vec![0],
+            inst,
+            controller: None,
+            light_index: 0,
+            light_parent: None,
+            map_id: 42,
+            variants: Vec::new(),
+            sounds: None,
+            tile: (0, 0),
+            var_parent: None,
+            texts: Vec::new(),
+            arrivals: false,
+            htmls: Vec::new(),
+            alpha_slots: Vec::new(),
+            alpha_last: Vec::new(),
+        });
+
+        // 1. Raycast towards (0, 1, 0) should hit the quad at (0, 5, 0)
+        let hit = world.scenery_object_hit(DVec3::ZERO, glam::Vec3::Y, 50.0, 0.0);
+        assert!(hit.is_some(), "scenery object hit should find the switch");
+        let h = hit.unwrap();
+        assert_eq!(h.map_id, 42);
+        assert_eq!(h.event, "toggle_switch");
+        assert!((h.t - 5.0).abs() < 1e-3);
+
+        // 2. Raycast in opposite direction should miss
+        let miss = world.scenery_object_hit(DVec3::ZERO, -glam::Vec3::Y, 50.0, 0.0);
+        assert!(miss.is_none());
+
+        // 3. Test click triggers toggle_switch: Switch was 0, becomes 1
+        assert_eq!(world.scripted.lock()[0].inst.var("Switch"), Some(0.0));
+        assert!(world.scenery_object_click(42, "toggle_switch"));
+        assert_eq!(world.scripted.lock()[0].inst.var("Switch"), Some(1.0));
+
+        // 4. Test drag triggers toggle_switch_drag with mouse_x
+        assert!(world.scenery_object_drag(42, "toggle_switch", 0.75, 0.0));
+        assert_eq!(world.scripted.lock()[0].inst.var("Switch"), Some(0.75));
+
+        // 5. Test release triggers toggle_switch_off
+        assert!(world.scenery_object_release(42, "toggle_switch"));
+        assert_eq!(world.scripted.lock()[0].inst.var("Switch"), Some(0.0));
     }
 }
 

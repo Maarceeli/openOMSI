@@ -3703,12 +3703,14 @@ impl TrailerPart {
     /// Transform for mesh `i` relative to the part's position; a shadow blob lies on the
     /// ground under its axles (see `VehicleInstance::mesh_local_transform`).
     pub fn mesh_local_transform(&self, i: usize) -> Mat4 {
+        let xf = self.mesh_transforms.get(i).copied().unwrap_or(Mat4::IDENTITY);
         if is_shadow_mesh(&self.ty, i) {
+            let lift = if self.ty.def.is_rail() { 0.0 } else { -self.ground_lift };
             return self.body_rotation()
-                * onto_plane([-self.ground_lift, 0.0, 0.0])
-                * self.mesh_transforms[i];
+                * onto_plane([lift, 0.0, 0.0])
+                * xf;
         }
-        self.body_rotation() * self.mesh_transforms[i]
+        self.body_rotation() * xf
     }
 
     /// Where this part hangs on the one in front: the coupling point in the frame of the
@@ -4082,12 +4084,13 @@ impl VehicleInstance {
     /// lies at z = 0, which the springs' sag takes 10-16 cm under the road, where no depth
     /// bias brings it through.
     pub fn mesh_local_transform(&self, i: usize) -> Mat4 {
+        let xf = self.mesh_transforms.get(i).copied().unwrap_or(Mat4::IDENTITY);
         if is_shadow_mesh(&self.ty, i) {
             return self.body_rotation()
                 * onto_plane(self.contact_plane())
-                * self.mesh_transforms[i];
+                * xf;
         }
-        self.body_rotation() * self.mesh_transforms[i]
+        self.body_rotation() * xf
     }
 
     /// The plane the wheels stand on, in the body frame: z = p[0] + p[1]·x + p[2]·y (m).
@@ -4095,6 +4098,9 @@ impl VehicleInstance {
     /// pushed up into the body), the simple physics asks the ground under each wheel; an
     /// AI copy stands `ai_rest_offset` above its plane.
     pub fn contact_plane(&self) -> [f32; 3] {
+        if self.ty.def.is_rail() {
+            return [0.0, 0.0, 0.0];
+        }
         let mut points: Vec<Vec3> = Vec::new();
         if let Some(rb) = &self.rigid {
             let standing = rb.wheels.iter().any(|w| w.on_ground);
@@ -5001,6 +5007,14 @@ mod tests {
             (axle[0] - 0.15).abs() < 1e-5 && axle[1] == 0.0 && axle[2] == 0.0,
             "{axle:?}"
         );
+
+        // A rail vehicle sits level on the track and its shadow blob is not distorted by road ground.
+        let rail_ty = coupling_test_type(Some(5.0));
+        let rail_v = VehicleInstance::new(rail_ty.clone(), VehicleHost::new(Default::default()));
+        assert_eq!(rail_v.contact_plane(), [0.0, 0.0, 0.0]);
+        let rail_t = TrailerPart::new_ex(rail_ty.clone(), &rail_ty, false, false, &rail_ty.program, 0, 0);
+        let m_local = rail_t.mesh_local_transform(0);
+        assert!(!m_local.is_nan());
     }
 
     /// Volvo Wright's dashboard rear-close trigger falls back to its explicit external-close

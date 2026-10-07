@@ -21,6 +21,8 @@ pub(crate) fn is_game_action(name: &str) -> bool {
 
 /// How far (m) a click reaches a page (`[htmltexture]`) on a scenery object.
 const HTML_OBJECT_REACH: f32 = 4.0;
+/// How far (m) a click reaches a scenery object with a `[mouseevent]`.
+pub(crate) const SCENERY_OBJECT_REACH: f32 = 50.0;
 
 impl App {
     /// Save the personnel file and the session summary (once: every caller ends the game,
@@ -1373,6 +1375,10 @@ impl App {
         if self.html_object_click(pressed) {
             return;
         }
+        // a scenery object with [mouseevent]: interactive switches, crossing buttons, etc.
+        if self.scenery_object_click(pressed) {
+            return;
+        }
         // on foot: the own bus's switches, doors and flaps from inside it or standing by it
         if self.view == "foot" && !self.foot_reaches_bus() {
             return;
@@ -1471,8 +1477,47 @@ impl App {
         true
     }
 
+    /// A click on a scenery object with a `[mouseevent]`. True when the click was the object's:
+    /// the press triggers its script, the release triggers `<event>_off`.
+    fn scenery_object_click(&mut self, pressed: bool) -> bool {
+        let Some(w) = self.world.clone() else { return false };
+        if !pressed {
+            let Some((id, event)) = self.pressed_scenery_object.take() else { return false };
+            w.scenery_object_release(id, &event);
+            self.dragging = false;
+            return true;
+        }
+        #[cfg(windows)]
+        if self.vr.is_some() && self.mouse_drive && self.game_menu.is_none() && matches!(self.view.as_str(), "driver" | "pax") {
+            return false;
+        }
+        let Some((o, d, spread)) = self.cursor_ray_now() else { return false };
+        let veh_has_control = if self.view == "foot" && !self.foot_reaches_bus() {
+            false
+        } else {
+            self.player.as_ref().is_some_and(|p| {
+                p.pick(o, d, spread).is_some() || p.pick_trailer(o, d, spread).is_some()
+            })
+        };
+        if veh_has_control {
+            return false;
+        }
+        let Some(hit) = w.scenery_object_hit(o, d, SCENERY_OBJECT_REACH, spread) else { return false };
+        if self.player.as_ref().and_then(|p| p.opaque_body_hit(o, d)).is_some_and(|t| t < hit.t) {
+            return false;
+        }
+        if let Some(p) = self.player.as_mut() {
+            p.release();
+        }
+        self.drag_delta = (0.0, 0.0);
+        w.scenery_object_click(hit.map_id, &hit.event);
+        self.pressed_scenery_object = Some((hit.map_id, hit.event));
+        self.dragging = true;
+        true
+    }
+
     /// The ray under the cursor now (see [`Self::cockpit_cursor_ray`]).
-    fn cursor_ray_now(&self) -> Option<(glam::DVec3, glam::Vec3, f32)> {
+    pub(crate) fn cursor_ray_now(&self) -> Option<(glam::DVec3, glam::Vec3, f32)> {
         let (cam, s) = self.camera.as_ref().zip(self.surface.as_ref())?;
         Some(self.cockpit_cursor_ray(cam, (s.config.width, s.config.height)))
     }
@@ -1492,7 +1537,11 @@ impl App {
             return;
         }
         let (dx, dy) = std::mem::take(&mut self.drag_delta);
-        if let Some(p) = self.player.as_mut() {
+        if let Some((map_id, ref ev)) = self.pressed_scenery_object {
+            if let Some(w) = self.world.as_ref() {
+                w.scenery_object_drag(map_id, ev, dx, dy);
+            }
+        } else if let Some(p) = self.player.as_mut() {
             p.drag(dx, dy);
         }
     }
@@ -4185,6 +4234,18 @@ impl App {
             _ => (None, false),
         };
         let (found, hand) = found;
+        let (found, hand) = if let (Some(found), true) = (found.as_ref(), hand) {
+            (Some(found.clone()), true)
+        } else if let (Some(w), Some((o, d, spread))) = (self.world.as_ref(), self.cursor_ray_now()) {
+            let blocked = self.player.as_ref().and_then(|p| p.opaque_body_hit(o, d));
+            if let Some(hit) = w.scenery_object_hit(o, d, SCENERY_OBJECT_REACH, spread).filter(|h| blocked.map_or(true, |t| t >= h.t)) {
+                (Some((hit.event, true)), true)
+            } else {
+                (found, hand)
+            }
+        } else {
+            (found, hand)
+        };
         self.hover_hand = hand;
         match found {
             Some((name, true)) => {

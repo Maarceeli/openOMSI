@@ -584,6 +584,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         dragging: false,
         html_pressed: None,
         html_object_pressed: None,
+        pressed_scenery_object: None,
         drag_delta: (0.0, 0.0),
         look: (0.0, 0.0),
         look_smooth: (0.0, 0.0),

@@ -939,7 +939,13 @@ impl ApplicationHandler for App {
                         // not already consumed them (#744).
                         if self.dragging {
                             let (dx, dy) = std::mem::take(&mut self.drag_delta);
-                            p.drag(dx, dy);
+                            if let Some((map_id, ref ev)) = self.pressed_scenery_object {
+                                if let Some(w) = self.world.as_ref() {
+                                    w.scenery_object_drag(map_id, ev, dx, dy);
+                                }
+                            } else {
+                                p.drag(dx, dy);
+                            }
                         }
                         // (not in the headset: the player's own head moves there, and a head
                         // thrown about by the bus on top of it made the whole cab sway and
@@ -972,7 +978,13 @@ impl ApplicationHandler for App {
                     } else if self.dragging {
                         // paused / no ground: still deliver held-switch `_drag` (was unconditional before)
                         let (dx, dy) = std::mem::take(&mut self.drag_delta);
-                        p.drag(dx, dy);
+                        if let Some((map_id, ref ev)) = self.pressed_scenery_object {
+                            if let Some(w) = self.world.as_ref() {
+                                w.scenery_object_drag(map_id, ev, dx, dy);
+                            }
+                        } else {
+                            p.drag(dx, dy);
+                        }
                     }
                     // a script that set the time of day (`(S.S.Time)`) moves the game's clock
                     if let Some(t) = p.vehicle.host.time_written.take() {
@@ -3161,6 +3173,13 @@ impl App {
                     // the movement by 10 (the ignition key), 200 (the parking brake)
                     // or 500 (the driver's window), so a few pixels would do nothing
                     p.wheel(o, d, spread, -amount * 40.0);
+                    return;
+                }
+            }
+            if let (Some(w), Some((o, d, spread))) = (self.world.as_ref(), self.cursor_ray_now()) {
+                let blocked = self.player.as_ref().and_then(|p| p.opaque_body_hit(o, d));
+                if let Some(hit) = w.scenery_object_hit(o, d, crate::input_script::SCENERY_OBJECT_REACH, spread).filter(|h| blocked.map_or(true, |t| t >= h.t)) {
+                    w.scenery_object_wheel(hit.map_id, &hit.event, -amount * 40.0);
                     return;
                 }
             }
